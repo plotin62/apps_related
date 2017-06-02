@@ -1,0 +1,149 @@
+#!/bin/bash
+# https://cs.corp.google.com/piper///depot/google3/wireless/android/finsky/proto/common.proto?rcl=150542007&l=285
+
+SET accounting_group analytics-internal-processing-dev;
+SET min_completion_ratio 1;
+SET io_timeout 2400;
+SET nest_join_schema true;
+SET runtime_name dremel;
+SET materialize_overwrite true;
+SET materialize_owner_group analytics-internal-processing-dev;
+SET nest_join_schema False;
+# SET run_as_mdb_account analytics-internal-processing-dev-logs;
+
+# Top apps by IAP.
+SELECT
+  dim.doc.apps.app.package_name AS package_name,
+  SUM(metrics.orders.currency_micros_charged_usd_equivalent)/1000000
+    AS iap_rev
+FROM play_analytics.orderstats.all
+WHERE
+  # ANDROID_APPS
+  dim.doc.docid.backend = 3
+  # ANDROID_IN_APP_ITEM
+  AND dim.doc.docid.type = 11
+   AND STRFTIME_USEC(
+    TIME_USEC_TO_DAY(dim.purchase.creation_time.utc_hour_millis*1000),
+      '%Y%m%d') >= '20161001'
+GROUP@50 BY 1
+ORDER BY 2 DESC
+LIMIT 50;
+
+# Charts on IAP.
+library(ginstall)
+library(gfile)
+library(namespacefs)
+library(rglib)
+library(cfs)
+library(dremel)
+library(gbm)
+library(Hmisc)
+library(ggplot2)
+library(lubridate)
+InitGoogle()
+options("scipen"=100, "digits"=6)
+
+myConn <- DremelConnect()
+DremelSetMinCompletionRatio(myConn, 1.0)
+DremelSetAccountingGroup(myConn,'urchin-processing-qa')
+DremelSetMaterializeOwnerGroup(myConn, 'materialize-a-dremel')
+DremelSetMaterializeOverwrite(myConn, TRUE)
+DremelSetIOTimeout(myConn, 7200)
+
+# Global IAP.
+# YT in this context actually refers to Play Movies/TV
+gl <- DremelExecuteQuery("
+  SELECT
+    STRFTIME_USEC(TIME_USEC_TO_DAY(dim.purchase.creation_time.utc_hour_millis
+      *1000),'%Y%m%d') AS date,
+    SUM(metrics.orders.currency_micros_charged_usd_equivalent)/1000000
+      AS iap_rev
+  FROM play_analytics.orderstats.all
+  WHERE
+    # ANDROID_APPS
+    dim.doc.docid.backend = 3
+    # ANDROID_IN_APP_ITEM
+    AND dim.doc.docid.type = 11
+     AND STRFTIME_USEC(
+      TIME_USEC_TO_DAY(dim.purchase.creation_time.utc_hour_millis*1000),
+        '%Y%m%d') >= '20161001'
+  GROUP@50 BY 1
+;", myConn)
+
+gl$date <- ymd(gl$date)
+pd <- position_dodge(.1)
+ggplot(data = gl, aes(x = date, y = iap_rev/1000000)) +
+geom_point(aes(colour = 'red', alpha = 0.1)) +
+stat_smooth(position=pd, method='loess', fullrange=TRUE, size=1.2, span=.4) +
+theme_bw() +
+coord_cartesian(ylim = c(0, 70)) +
+theme(legend.position="none") +
+theme(strip.text=element_text(size=11,face="bold")) +
+theme(axis.text.x=element_text(size=11,face="bold", angle = 45, hjust = 1)) +
+theme(axis.text.y=element_text(size=11,face="bold", color="gray26")) +
+ylab("Revenue in Milllions") +
+ggtitle("Global IAP Revenue.") +
+theme(plot.title = element_text(lineheight=.8))+
+xlab("")
+
+# Total Payable in Play.
+d <- DremelExecuteQuery("
+  SELECT
+    dim.doc.docid.type AS spend_type,
+    STRFTIME_USEC(TIME_USEC_TO_DAY(dim.purchase.creation_time.utc_hour_millis
+      *1000),'%Y%m%d') AS date,
+    SUM(metrics.orders.currency_micros_charged_usd_equivalent)/1000000 AS rev
+  FROM play_analytics.orderstats.all
+  WHERE STRFTIME_USEC(
+    TIME_USEC_TO_DAY(dim.purchase.creation_time.utc_hour_millis*1000),'%Y%m%d')
+    >= '20161001'
+  GROUP@500 BY 1,2
+;", myConn)
+
+d$date <- ymd(d$date)
+pd <- position_dodge(.1)
+ggplot(data = d, aes(x = date, y = rev/1000000)) +
+geom_point(aes(colour = 'red', alpha = 0.1)) +
+stat_smooth(position=pd, method="loess", fullrange=TRUE, size=1.2, span=.4) +
+facet_grid(spend_type~., scales='free') +
+theme_bw() +
+theme(legend.position="none") +
+theme(strip.text=element_text(size=11,face="bold")) +
+theme(axis.text.x=element_text(size=11,face="bold", angle = 45, hjust = 1)) +
+theme(axis.text.y=element_text(size=11,face="bold", color="gray26")) +
+ylab("Revenue in Milllions") +
+ggtitle("Total Payable in Play.") +
+theme(plot.title = element_text(lineheight=.8))+
+xlab("")
+
+dc <- DremelExecuteQuery("
+  SELECT
+    dim.doc.docid.type AS spend_type,
+    dim.loc.billing_address_country AS country,
+    STRFTIME_USEC(TIME_USEC_TO_DAY(dim.purchase.creation_time.utc_hour_millis
+      *1000),'%Y%m%d') AS date,
+    SUM(metrics.orders.currency_micros_charged_usd_equivalent)/1000000 AS rev
+  FROM play_analytics.orderstats.all
+  WHERE STRFTIME_USEC(
+    TIME_USEC_TO_DAY(dim.purchase.creation_time.utc_hour_millis*1000),'%Y%m%d')
+    >= '20161001'
+    AND dim.loc.billing_address_country IN ('US','JP')
+  GROUP@500 BY 1,2,3
+  HAVING rev < 60000000
+;", myConn)
+
+dc$date <- ymd(dc$date)
+pd <- position_dodge(.1)
+ggplot(data = dc, aes(x = date, y = rev/1000000)) +
+geom_point(aes(colour = 'red', alpha = 0.1)) +
+stat_smooth(position=pd, method="loess", fullrange=TRUE, size=1.2, span=.4) +
+facet_grid(spend_type~country, scales='free') +
+theme_bw() +
+theme(legend.position="none") +
+theme(strip.text=element_text(size=11,face="bold")) +
+theme(axis.text.x=element_text(size=11,face="bold", angle = 45, hjust = 1)) +
+theme(axis.text.y=element_text(size=11,face="bold", color="gray26")) +
+ylab("Revenue in Milllions") +
+ggtitle("Total Payable in Play.") +
+theme(plot.title = element_text(lineheight=.8))+
+xlab("")
